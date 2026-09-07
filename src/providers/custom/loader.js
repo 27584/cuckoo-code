@@ -7,24 +7,43 @@ const fs = require('fs');
 const path = require('path');
 const { app } = require('electron');
 
-// preload 渲染进程无法访问 electron.app（app 为 undefined），
-// 而 providers 模块会在渲染进程被 require 后立即加载自定义 Provider，
-// 导致不停打印 "Cannot read properties of undefined (reading 'getPath')"。
-// 渲染进程只需内置 Provider 的 URL 匹配能力，因此直接跳过自定义 Provider 加载。
-const isRenderer = process.type === 'renderer';
+// 渲染进程无法访问 electron.app（app 为 undefined），但页面内的自动解析/发送需要
+// 自定义 Provider 的方法（isResponseComplete 等），不能只靠内置 Provider。
+// 渲染进程的 userData 路径由主进程在创建窗口时经 additionalArguments 注入
+// （--cuckoo-user-data=），据此读取配置并加载自定义 Provider。
+function isRendererProcess() {
+  return process.type === 'renderer';
+}
+
+// 缓存：完成检测轮询等高频路径每 2s 调用一次 loadCustomProviders，避免反复 require 与刷屏
+let customProviderCache = null;
+function invalidateCustomProviderCache() {
+  customProviderCache = null;
+}
 
 const CUSTOM_CONFIG_FILE = 'custom-providers.json';
 const CUSTOM_PROVIDERS_DIR = 'custom-providers';
 
+function getUserDataPath() {
+  if (!isRendererProcess() && app && typeof app.getPath === 'function') {
+    return app.getPath('userData');
+  }
+  const arg = (process.argv || []).find((a) => a.startsWith('--cuckoo-user-data='));
+  return arg ? arg.slice('--cuckoo-user-data='.length) : null;
+}
+
 function getConfigPath() {
-  return path.join(app.getPath('userData'), CUSTOM_CONFIG_FILE);
+  const base = getUserDataPath();
+  return base ? path.join(base, CUSTOM_CONFIG_FILE) : null;
 }
 
 function getCustomProvidersDir() {
-  return path.join(app.getPath('userData'), CUSTOM_PROVIDERS_DIR);
+  const base = getUserDataPath();
+  return base ? path.join(base, CUSTOM_PROVIDERS_DIR) : null;
 }
 
 function ensureCustomProvidersDir() {
+  if (isRendererProcess()) return null;
   const dir = getCustomProvidersDir();
   if (!fs.existsSync(dir)) {
     fs.mkdirSync(dir, { recursive: true });
@@ -33,9 +52,9 @@ function ensureCustomProvidersDir() {
 }
 
 function readConfig() {
-  if (isRenderer) return { paths: [] };
   try {
     const file = getConfigPath();
+    if (!file) return { paths: [] };
     if (fs.existsSync(file)) {
       return JSON.parse(fs.readFileSync(file, 'utf-8'));
     }
@@ -46,6 +65,7 @@ function readConfig() {
 }
 
 function writeConfig(config) {
+  if (isRendererProcess()) return;
   try {
     fs.writeFileSync(getConfigPath(), JSON.stringify(config, null, 2), 'utf-8');
   } catch (err) {
@@ -71,7 +91,7 @@ function loadProviderFromFile(filePath) {
 }
 
 function loadCustomProviders() {
-  if (isRenderer) return [];
+  if (customProviderCache) return customProviderCache;
   const config = readConfig();
   const providers = [];
   for (const p of config.paths || []) {
@@ -93,6 +113,7 @@ function loadCustomProviders() {
       console.error('[CustomProvider] 加载失败:', p, err.message);
     }
   }
+  customProviderCache = providers;
   return providers;
 }
 
@@ -124,9 +145,10 @@ function importCustomProvider(sourcePath, options = {}) {
   // 复制到 userData/custom-providers/
   fs.copyFileSync(sourcePath, targetPath);
 
-  // 写配置
+  // 写配置（导入/替换都会改变 provider 集合，无条件失效缓存）
   const config = readConfig();
   if (!config.paths) config.paths = [];
+  invalidateCustomProviderCache();
   if (!config.paths.includes(targetPath)) {
     config.paths.push(targetPath);
   }
@@ -171,9 +193,11 @@ function removeCustomProviderPath(filePath) {
       console.error('[CustomProvider] 删除文件失败:', filePath, err.message);
     }
   }
+  invalidateCustomProviderCache();
 }
 
 module.exports = {
+  invalidateCustomProviderCache,
   loadCustomProviders,
   importCustomProvider,
   replaceCustomProvider,
